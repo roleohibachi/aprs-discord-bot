@@ -39,8 +39,6 @@ def main():
     
     msgcount=int(time.time()%(pow(10,4))) #gotta start somewhere
     AIS = aprslib.IS(adminCall,passwd,host="noam.aprs2.net",port=14580)
-    #AIS.set_login(adminCall,passwd)
-    #AIS.set_server("noam.aprs2.net",port=14580)
     AIS.set_filter("g/"+botCall)
 
     #configure Discord
@@ -55,20 +53,21 @@ def main():
             elif 'message_text' in packet:
                 print("Got a message! Here it is: "+packet['from'] + ": " + packet['message_text']+"... msgno "+packet['msgNo'])
                 discord.post(
+                    username="aprsbot",
                     embeds=[
                         {
                             "author": {
                                 "name": "New APRS Message Received",
                                 "url": "https://aprs.fi/?c=raw&call="+packet['from'],
                             },
-                            "title": packet['from'],
+                            "title": packet['from']+": ",
                             "description": packet['message_text'],
                             "fields": [
                                 {"name": "via", "value": packet['via'], "inline": True},
                                 {"name": "msgNo", "value": packet['msgNo'], "inline": True},
                             ],
                             "footer": {
-                                "text": "Licensed radio amateurs can reply to this message using APRS. Replies in this channel will not be forwarded.",
+                                "text": "Licensed radio amateurs can post to this channel by sending APRS messages to callsign 'PPRAA' with standard message format. Replies in Discord will not be forwarded (yet...).",
                             },
                         }
                     ],
@@ -82,23 +81,19 @@ def main():
 
         AIS.connect()
         msgcount = send_aprs_msg(AIS,fromCall=botCall,toCall=adminCall+adminSSID,message="script online",lineNo=msgcount)
-        discord.post(content="bot online")
 
         # by default `raw` is False, then each line is ran through aprslib.parse()
         AIS.consumer(aprs_handler, raw=False)
 
         #we should never make it to here
         AIS.close()
-        discord.post(content="bot offline")
 
     except KeyboardInterrupt:
         print("Shutdown requested... notifying admin")
         msgcount = send_aprs_msg(AIS,fromCall=botCall,toCall=adminCall+adminSSID,message="script offline",lineNo=msgcount)
         AIS.close()
-        discord.post(content="bot offline")
     except Exception as err:
         AIS.close()
-        discord.post(content="bot offline")
         print(traceback.format_exc())
         sys.exit(1)
     
