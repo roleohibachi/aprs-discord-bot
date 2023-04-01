@@ -40,7 +40,7 @@ class DiscordClient(discord.Client):
 
     async def on_message(self, message):
         print(f'Message from {message.author}: {message.content}')
-        if message.author == myDiscordClient.user:
+        if message.author == self.user:
             return
         if message.content.startswith('$hello'):
             await message.channel.send('Hello!')
@@ -62,11 +62,6 @@ class TenRingDict(dict):
                 self[k] = v
         for k, v in kwargs.items():
             self[k] = v
-
-class APRSClient():
-    def __init__(self, *args, **kwargs):
-            
-async def bridge(DiscordClient,APRSClient):
 
 async def main():
     parser = argparse.ArgumentParser(description='Bridge between APRS and Discord.')
@@ -103,13 +98,21 @@ async def main():
     AIS.set_filter("g/"+args.botCall)
 
     try:
-        await myDiscordClient.start(args.botSecret)
-        #await myDiscordClient.wait_until_ready()
+        logging.debug("logging in to discord...")
+        await myDiscordClient.login(token=args.botSecret)
+        logging.debug("logged in. Connecting...")
+        discord_task = asyncio.create_task(myDiscordClient.connect())
+        logging.debug("Connected. Waiting for ready.")
+        await myDiscordClient.wait_until_ready()
+        logging.debug("discord ready.. fetching channel.")
         discordChannel = myDiscordClient.get_channel(int(args.botChannelID))
+        logging.debug("got channel "+str(discordChannel))
 
-        await discordChannel.send("I'm online")
+        #await discordChannel.send("I'm online")
+        #logging.debug("sending first msg")
+        await discordClient.change_presence(status=discord.Status.online, activity=None)
 
-        async def aprs_handler(packet):
+        def aprs_handler(packet):
             try:
                 packet = aprslib.parse(packet)
                 if 'format' in packet and packet['format'] == "message":
@@ -127,33 +130,33 @@ async def main():
                                         "url": "https://aprs.fi/?c=raw&call="+packet['from'],
                                         "timestamp": str(datetime.now()),
                                         "footer": {
-                                            "text": "Licensed radio amateurs can post to this channel by sending APRS messages to callsign 'PPRAA' with standard message format.",
+                                            "text": "Licensed radio amateurs can post to this channel by sending APRS messages to callsign "+args.botCall+" with standard message format.",
                                         },
                                         "fields": [
                                             {"name": "via", "value": packet['via'], "inline": True},
                                             {"name": "msgNo", "value": packet['msgNo'], "inline": True},
                                         ],
                                     })
-                            #ackTask = loop.create_task(send_aprs_ack(AIS,fromCall=args.botCall,toCall=packet['from'],msgNo=packet['msgNo']))
-                            await send_aprs_ack(AIS,fromCall=args.botCall,toCall=packet['from'],msgNo=packet['msgNo'])
-                            #discordSendTask = loop.create_task(discordChannel.send(embed=embed))
-                            await discordChannel.send(embed=embed)
+                            #await send_aprs_ack(AIS,fromCall=args.botCall,toCall=packet['from'],msgNo=packet['msgNo'])
+                            #await discordChannel.send(embed=embed)
                             lastHeard.update({packet['from']:packet['msgNo']})
                         else:
                             logging.debug('Heard this one before - not posting, repeating ACK')
-                            #ackTask = loop.create_task(send_aprs_ack(AIS,fromCall=args.botCall,toCall=packet['from'],msgNo=packet['msgNo']))
-                            await send_aprs_ack(AIS,fromCall=args.botCall,toCall=packet['from'],msgNo=packet['msgNo'])
+                            #await send_aprs_ack(AIS,fromCall=args.botCall,toCall=packet['from'],msgNo=packet['msgNo'])
             except (aprslib.ParseError, aprslib.UnknownFormat) as exp:
                 logging.info("Parsing that packet failed - unknown format.")
         
         AIS.connect()
-        await loop.run_in_executor(executor=None,func=AIS.consumer(aprs_handler, raw=True, blocking=True))
+        blocking_coro = asyncio.to_thread(AIS.consumer(aprs_handler, raw=True, blocking=True))
+        handler_task = asyncio.create_task(blocking_coro)
+        #asyncio.run_forever()
 
     except KeyboardInterrupt:
         logging.info("Shutting down gracefully")
+        await discordClient.change_presence(status=discord.Status.online, activity=None)
         #aprsMsgNo = await send_aprs_msg(AIS,fromCall=args.botCall,toCall=args.adminCall+adminSSID,message="script offline",lineNo=aprsMsgNo)
-        await discordChannel.send("I'm shutting down")
-        await loop.run_in_executor(executor=None,func=AIS.close())
+        #await discordChannel.send("I'm shutting down")
+        #await loop.run_in_executor(executor=None,func=AIS.close())
         print('aprsMsgNo on exit: '+str(aprsMsgNo))
 
 

@@ -81,32 +81,50 @@ def main():
     discord = Discord(url=args.botSecret)
 
     def aprs_handler(packet):
+        packet=re.sub(r'\x00','{',packet.decode('utf-8')) #KD0TRD's radio sends nulls instead of curly braces
+        packet=aprslib.parse(packet) #the packet is now a dict
         if 'format' in packet and packet['format'] == "message":
-            if 'response' in packet and packet['response'] == "ack":
+            
+            #is it an ACK for one of our previous messages?
+            if 'response' in packet and packet['response'] == "ack" and 'msgNo' in packet:
                 logging.debug("Got an ACK for message "+packet['msgNo'])
+
+            #is it a message?
             elif 'message_text' in packet:
-                logging.debug("Got a message! Here it is: "+packet['from'] + ": " + packet['message_text']+"... msgno "+packet['msgNo'])
-                if not packet['from'] in lastHeard:
-                    lastHeard.update({packet['from']:'0'})
-                if int(packet['msgNo']) > int(lastHeard[packet['from']]):
-                    embed={
-                                "title": packet['from']+": ",
-                                "type": "rich",
-                                "description": packet['message_text'],
-                                "url": "https://aprs.fi/?c=raw&call="+packet['from'],
-                                "timestamp": str(datetime.now()),
-                                "footer": {
-                                    "text": "Licensed radio amateurs can post to this channel by sending APRS messages to callsign 'PPRAA' with standard message format.",
-                                },
-                                "fields": [
-                                    {"name": "via", "value": packet['via'], "inline": True},
-                                    {"name": "msgNo", "value": packet['msgNo'], "inline": True},
-                                ],
-                            }
-    
-                discord.post(username=args.botName,embeds=[embed])
-                send_aprs_ack(AIS,fromCall=args.botCall,toCall=packet['from'],msgNo=packet['msgNo'])
-                lastHeard.update({packet['from']:packet['msgNo']})
+                logging.debug("Got a message! Here it is: "+str(packet['raw']))
+                #prep a discord post
+                embed={
+                       "title": packet['from']+": ",
+                       "type": "rich",
+                       "description": packet['message_text'],
+                       "url": "https://aprs.fi/?c=raw&call="+packet['from'],
+                       "timestamp": str(datetime.now()),
+                       "footer": {
+                           "text": "Licensed radio amateurs can post to this channel by sending APRS messages to callsign "+args.botCall+" with standard message format.",
+                       },
+                       "fields": [
+                           {"name": "via", "value": packet['via'], "inline": True},
+                           #{"name": "msgNo", "value": packet['msgNo'], "inline": True},
+                       ],
+                   }
+
+                post=True #we're planning on posting this to discord
+
+                #is the message sent with a message number (I hope)?
+                if 'msgNo' in packet:
+                    embed["fields"].append({"name": "msgNo", "value": packet['msgNo'], "inline": True})
+                    if not packet['from'] in lastHeard:
+                        #This is the first we've heard from this sender.
+                        #initialize a lastheard entry for them
+                        lastHeard.update({packet['from']:'-1'})
+                    if int(packet['msgNo']) <= int(lastHeard[packet['from']]):
+                        post=False
+                    else:
+                        lastHeard.update({packet['from']:packet['msgNo']})
+
+                if post:               
+                    discord.post(username=args.botName,embeds=[embed])
+                    send_aprs_ack(AIS,fromCall=args.botCall,toCall=packet['from'],msgNo=packet['msgNo'])
 
             else:
                 logging.debug('Heard this one before - not posting, repeating ACK')
@@ -116,10 +134,10 @@ def main():
 
         AIS.connect()
         aprsMsgNo = send_aprs_msg(AIS,fromCall=args.botCall,toCall=args.adminCall+args.adminSSID,message="script online",lineNo=aprsMsgNo)
-        discord.post(content="Bot online! Send an APRS message to PPRAA to have it posted here.",username=args.botName)
+        discord.post(content="Bot online! Send an APRS message to "+args.botCall+" to have it posted here.",username=args.botName)
 
         # by default `raw` is False, then each line is ran through aprslib.parse()
-        AIS.consumer(aprs_handler, raw=False)
+        AIS.consumer(aprs_handler, raw=True)
 
         #we should never make it to here
         AIS.close()
