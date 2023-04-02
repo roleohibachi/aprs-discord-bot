@@ -85,7 +85,8 @@ class TenRingDict(dict):
         for k, v in kwargs.items():
             self[k] = v
 
-async def main():
+async def main(loop):
+    
     parser = argparse.ArgumentParser(description='Bridge between APRS and Discord.')
     parser.add_argument( '-log',
         '--loglevel',
@@ -106,6 +107,7 @@ async def main():
 
     #Use DEBUG to disable APRS transmissions. Use INFO to get lots of logging
     logging.basicConfig( level=args.loglevel.upper() )
+    #if logging.getLogger().isEnabledFor(logging.DEBUG): loop.set_debug(True)
 
     aprsMsgNo=args.aprsMsgNo
 
@@ -177,12 +179,12 @@ async def main():
                                     }
 
                             logging.info("This one's worth posting to Discord. Let's do it.")
-                            asyncio.create_task(send_aprs_ack(AIS,fromCall=args.botCall,toCall=packet['from'],msgNo=packet['msgNo']))
-                            asyncio.create_task(discordChannel.send(embed=discord.Embed.from_dict(embed)))
+                            loop.create_task(send_aprs_ack(AIS,fromCall=args.botCall,toCall=packet['from'],msgNo=packet['msgNo']))
+                            loop.create_task(discordChannel.send(embed=discord.Embed.from_dict(embed)))
                             lastHeard.update({packet['from']:packet['msgNo']})
                         else:
                             logging.info('Heard this one before - not posting, repeating ACK')
-                            asyncio.create_task(send_aprs_ack(AIS,fromCall=args.botCall,toCall=packet['from'],msgNo=packet['msgNo']))
+                            loop.create_task(send_aprs_ack(AIS,fromCall=args.botCall,toCall=packet['from'],msgNo=packet['msgNo']))
             except (aprslib.ParseError, aprslib.UnknownFormat) as exp:
                 logging.info("Parsing that packet failed - unknown format.")
         
@@ -190,34 +192,48 @@ async def main():
         AIS.connect()
 
         #AIS.consumer() is a blocking synchronous function, so needs to be run in its own thread.
-        #TODO: DEBUG: 
-        #After ~20-30 seconds, discord complains that it hasn't been able to send heartbeats
-        #and can't post messages.
-        #I've tried making a coroutine that calls AIS.consumer() and loop.create_task()'ing it
-        #I've tried asyncio.run_in_executor()
-        #I've tried asyncio.to_thread (requires python 3.9+).
-        #They all seem to not *actually* run consumer() in the background! 
-        blocking_coro = asyncio.to_thread(AIS.consumer(aprs_callback, raw=True, blocking=True))
-        callback_task = asyncio.create_task(blocking_coro)
-        #asyncio.run_forever()
+        #Note: Ways to run sync functions from async functions:
+        #   - making a coroutine that calls AIS.consumer() and loop.create_task()'ing it
+        #   -  asyncio.run_in_executor()
+        #   -  asyncio.to_thread (requires python 3.9+).
+        aprsConsumerTask = asyncio.create_task(asyncio.to_thread(AIS.consumer, aprs_callback, raw=True, blocking=True))
+        await aprsConsumerTask
 
-    except KeyboardInterrupt:
-        logging.info("Shutting down gracefully")
+    except asyncio.CancelledError:
+
+        #shutdown discord
+        logging.info('setting status offline')
         await myDiscordClient.change_presence(status=discord.Status.offline, activity=None)
+        logging.info('closing discord')
         await myDiscordClient.close()
+        logging.info('discord is closed.')
+        discord_task.cancel()
+
+        #shutdown aprs
+        logging.info('closing aprs')
+        AIS.close()
+        logging.info('aprs is closed')
+        aprsConsumerTask.cancel()
 
         #aprs offline notification
         #aprsMsgNo = await send_aprs_msg(AIS,fromCall=args.botCall,toCall=args.adminCall+adminSSID,message="script offline",lineNo=aprsMsgNo)
 
-        #todo make this work
-        #await loop.run_in_executor(executor=None,func=AIS.close())
-
-        print('aprsMsgNo on exit: '+str(aprsMsgNo))
-
-
-    #send APRS notification
-    #aprsMsgNo = await send_aprs_msg(AIS,fromCall=args.botCall,toCall=args.adminCall+adminSSID,message="bot online",lineNo=aprsMsgNo)
+        return str(aprsMsgNo)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    loop = asyncio.get_event_loop()
+    loop.set_debug(True)
+    mainTask = None
+    try:
+        mainTask = loop.create_task(main(loop))
+        result = loop.run_until_complete(mainTask)
+        print('aprsMsgNo on exit: '+str(mainTask))
+    except KeyboardInterrupt as e:
+        logging.info("Shutting down gracefully")
+        if mainTask:
+            mainTask.cancel()
+        mainTask = loop.run_until_complete(asyncio.wait_for(mainTask, timeout=5))
+        logging.info('done cancelling')
+        print('aprsMsgNo on exit: '+str(mainTask))
+        os._exit(0) #let OS kill remaining threads
