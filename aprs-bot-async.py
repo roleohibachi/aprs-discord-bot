@@ -19,75 +19,145 @@ import functools
 #TODO: instead of just sending a message, start a thread. 
 #TODO: Then, replies in the thread should be transmitted via APRS.
 
-async def send_aprs_msg(AIS:  aprslib.IS, fromCall: str, toCall: str, message: str, lineNo: int): 
-    message=re.sub(r'[{:]','',message) #sanitize
+class APRSClient:
+    AIS = None
+    packetQueue = None
 
-    #build a packet according to APRS spec
-    pkt=fromCall+">APP614"+",TCPIP*::"+toCall.ljust(9, " ")+":"+message+"{"+str(lineNo)
+    def __init__(self, packetQueue):
+        self.packetQueue = packetQueue
 
-    if logging.getLogger().isEnabledFor(logging.DEBUG):
-        logging.info("Simulated send: "+pkt)
-    else:
-        sent=AIS.sendall(pkt)
-        logging.info("Sent: "+pkt)
+    #This overloaded dict will only keep the most recent ten items, 
+    #and automatically pop the oldest one.
+    #relies on python3 ordered dicts
+    #It's necessary because clients often don't receive their ACKs (such is radio)
+    from collections import Mapping
+    class TenRingDict(dict):
+        def __init__(self, other=None, **kwargs):
+            super().__init__()
+            self.update(other, **kwargs)
+    
+        def __setitem__(self, key, value):
+            if len(self)>=10: #gotta make room for the new value
+                self.pop(next(iter(self))) #pop the oldest
+            super().__setitem__(key, value)
+    
+        def update(self, other=None, **kwargs):
+            if other is not None:
+                for k, v in other.items() if isinstance(other, Mapping) else other:
+                    self[k] = v
+            for k, v in kwargs.items():
+                self[k] = v
+    
+    lastHeard = TenRingDict() 
+    # format: {
+    #    "AD8IS-10": {
+    #        "msgNo":10,
+    #        "thread":1234567890,
+    #        "acks":{34,35,36} #this is a set, so won't have dupes
+    #        }
+    #    }
 
-    #use ret value to update the serialized message count
-    #(serialized msgNo's are kept since the protocol implements ACKs)
-    return lineNo + 1 
+    async def _checkRx(msgNo,lastHeard):
+        while True:
+            asyncio.sleep(1)
+            if any(msgNo in callsign["acks"] for callsign in lastHeard.values()):
+                return True
+    
+    async def send_aprs_msg(AIS:  aprslib.IS, fromCall: str, toCall: str, message: str, lineNo: int): 
+        message=re.sub(r'[{:]','',message).encode('ascii','ignore')[:67] #sanitize
+        tries=3
+        counter=0
+    
+        #build a packet according to APRS spec
+        pkt=fromCall+">APP614"+",TCPIP*::"+toCall.ljust(9, " ")+":"+message+"{"+str(lineNo)
+        
+        while counter < tries:
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                logging.info("Simulated send: "+pkt)
+            else:
+                sent=AIS.sendall(pkt)
+                logging.info("Sent: "+pkt)
+            counter+=1
+            result = wait_for(_checkRx(message.number),timeout=30)
+            if result:
+                return True
+        return False
+    
+        #use ret value to update the serialized message count
+        #(serialized msgNo's are kept since the protocol implements ACKs)
+        return lineNo + 1 
+    
+    async def send_aprs_ack(AIS: aprslib.IS, toCall: str, msgNo: int, fromCall: str):
+        #build ACK packet per APRS spec
+        pkt=fromCall+">APP614"+",TCPIP*::"+toCall.ljust(9, " ")+":ack"+str(msgNo)
+    
+        #all ACKs should be sent twice. it's harder for mobile radios to receive an ACK than
+        #it is to transmit a message, so double-tapping the ACK is good practice. Even so,
+        #we may wind up receiving retransmitted messages that we've ACKed before. That's OK.
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.info("[DEBUG] Simulated ACK: "+pkt)
+            await asyncio.sleep(30)
+            logging.info("[DEBUG] Simulated ACK (double-tap): "+pkt)
+        else:
+            logging.info("Sending ACK: "+pkt)
+            sent=AIS.sendall(pkt)
+            await asyncio.sleep(30)
+            logging.info("Sending ACK (double-tap): "+pkt)
+            sent=AIS.sendall(pkt)
+        return None #there's nothing to return for an ACK
 
-async def send_aprs_ack(AIS: aprslib.IS, toCall: str, msgNo: int, fromCall: str):
-    #build ACK packet per APRS spec
-    pkt=fromCall+">APP614"+",TCPIP*::"+toCall.ljust(9, " ")+":ack"+str(msgNo)
+    def aprs_callback(packet):
+        packetQueue.sync_q.put(packet)
+        logging.info("put a packet on the queue, there are now "+str(packetQueue.sync_q.qsize()))
+        packetQueue.sync_q.join()
 
-    #all ACKs should be sent twice. it's harder for mobile radios to receive an ACK than
-    #it is to transmit a message, so double-tapping the ACK is good practice. Even so,
-    #we may wind up receiving retransmitted messages that we've ACKed before. That's OK.
-    if logging.getLogger().isEnabledFor(logging.DEBUG):
-        logging.info("[DEBUG] Simulated ACK: "+pkt)
-        await asyncio.sleep(30)
-        logging.info("[DEBUG] Simulated ACK (double-tap): "+pkt)
-    else:
-        logging.info("Sending ACK: "+pkt)
-        sent=AIS.sendall(pkt)
-        await asyncio.sleep(30)
-        logging.info("Sending ACK (double-tap): "+pkt)
-        sent=AIS.sendall(pkt)
-    return None #there's nothing to return for an ACK
+    def aprsFuture(loop):
+        return loop.run_in_executor(None, functools.partial(AIS.consumer, aprs_callback, immortal=True, raw=True, blocking=True))
+
+        
 
 class DiscordClient(discord.Client):
+    packetQueue = None
+    def __init__(self, packetQueue, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.packetQueue = packetQueue
+
     async def on_ready(self):
         logging.info(f'Logged on as {self.user}!')
 
     async def on_message(self, message):
-        logging.info(f'Message from {message.author}: {message.content}')
+
         #don't talk to yourself, silly bot
         if message.author == self.user:
             return
+
+        logging.info(f'Message from {message.author} aka {message.author.nick}: {message.content}')
+
+        if message.reference:
+            logging.info(f'(this is a reply to item '+str(message.reference))
+            #not doing anything with replies for now
+
+        if message.channel and any(callsign['thread']==message.channel.id for callsign in lastHeard.values()): #this is in a thread I care about
+            for callsign in lastHeard:
+                if lastHeard[callsign]["thread"]==message.channel.id:
+                    logging.info('(which I recognize as a reply to '+callsign)
+                    memberRole = discord.utils.find(lambda r: r.name == "PPRAA Member", message.guild.roles)
+                    if memberRole in message.author.roles:
+                        fromCall=str(message.author.nick.split('|')[1].strip().upper().replace('Ø','0').encode('ascii', 'ignore'))
+                        logging.info(f"(and since you're licensed, I'll forward via aprs, from {fromCall}")
+                        await message.add_reaction('\N{Clock Face One-Thirty}')
+                        if (await trySend(str(message)))
+                            await message.clear_reaction('\N{Clock Face One-Thirty}')
+                            await message.add_reaction('\N{THUMBS UP SIGN}')
+                        else:
+                            await message.clear_reaction('\N{Clock Face One-Thirty}')
+                            await message.add_reaction('\N{Warning Sign}')
+
         #TODO debug remove this test trigger
         if message.content.startswith('$hello'):
             await message.channel.send('Hello!')
 
-#This overloaded dict will only keep the most recent ten items, and automatically pop the oldest one.
-#relies on python3 ordered dicts
-from collections import Mapping
-class TenRingDict(dict):
-    def __init__(self, other=None, **kwargs):
-        super().__init__()
-        self.update(other, **kwargs)
-
-    def __setitem__(self, key, value):
-        if len(self)>=10: #gotta make room for the new value
-            self.pop(next(iter(self))) #pop the oldest
-        super().__setitem__(key, value)
-
-    def update(self, other=None, **kwargs):
-        if other is not None:
-            for k, v in other.items() if isinstance(other, Mapping) else other:
-                self[k] = v
-        for k, v in kwargs.items():
-            self[k] = v
-
-async def aprs_worker(AIS, discordChannel, queue: janus.AsyncQueue, lastHeard, args):
+async def bridge(AIS, discordChannel, queue: janus.AsyncQueue, lastHeard, args):
     while True:
         packet = await queue.get()
         print("found a packet on the queue: "+str(packet))
@@ -104,9 +174,15 @@ async def aprs_worker(AIS, discordChannel, queue: janus.AsyncQueue, lastHeard, a
                     if not packet['from'] in lastHeard:
                         #this is a new client! add them to the tracker
                         #use msgNo zero to initialize - aprs spec is always a positive number
-                        lastHeard.update({packet['from']:'0'})
+                        lastHeard.update({
+                            packet['from']:{
+                                "msgNo":0,
+                                "thread":None,
+                                "acks":{}
+                                }
+                           })
 
-                    if int(packet['msgNo']) > int(lastHeard[packet['from']]):
+                    if int(packet['msgNo']) > int(lastHeard[packet['from']]["msgNo"]):
                         #note: this will run if it's a higher msgNo OR ...
                         #if msgNo was set to zero by initialization
 
@@ -129,7 +205,7 @@ async def aprs_worker(AIS, discordChannel, queue: janus.AsyncQueue, lastHeard, a
                         logging.info("This one's worth posting to Discord. Let's do it.")
                         asyncio.create_task(send_aprs_ack(AIS,fromCall=args.botCall,toCall=packet['from'],msgNo=packet['msgNo']))
                         asyncio.create_task(discordChannel.send(embed=discord.Embed.from_dict(embed)))
-                        lastHeard.update({packet['from']:packet['msgNo']})
+                        lastHeard[packet['from']].update({"msgNo":packet['msgNo']})
                     else:
                         logging.info('Heard this one before - not posting, repeating ACK')
                         asyncio.create_task(send_aprs_ack(AIS,fromCall=args.botCall,toCall=packet['from'],msgNo=packet['msgNo']))
@@ -164,11 +240,6 @@ async def main():
 
     aprsMsgNo=args.aprsMsgNo
 
-    # a record of the ten last heard APRS msgNo's.
-    #This is how we keep from re-posting retransmissions to discord.
-    #It's necessary because clients often don't receive their ACKs (such is radio)
-    lastHeard = TenRingDict() 
-
     #This queue is thread-safe.
     #aprslib puts packets in queue from one thread
     #discord gets those packets from the queue and processes them in another
@@ -177,13 +248,15 @@ async def main():
     #configure Discord
     intents = discord.Intents.default()
     intents.message_content = True
-    myDiscordClient = DiscordClient(intents=intents)
+    myDiscordClient = DiscordClient(packetQueue, intents=intents)
 
     #configure APRS
-    AIS = aprslib.IS(args.adminCall,args.adminPass,host=args.aprsHost,port=args.aprsPort)
-    AIS.set_filter("g/"+args.botCall)
+    myAPRSClient = APRSClient(packetQueue)
+    myAPRSClient.AIS = aprslib.IS(args.adminCall,args.adminPass,host=args.aprsHost,port=args.aprsPort)
+    myAPRSClient.AIS.set_filter("g/"+args.botCall)
 
     try:
+        #start discord
         logging.info("Discord logging in...")
         await myDiscordClient.login(token=args.botSecret)
         logging.info("Discord logged in. Connecting...")
@@ -194,29 +267,18 @@ async def main():
         discordChannel = myDiscordClient.get_channel(int(args.botChannelID))
         logging.info("Discord will use channel "+str(discordChannel))
 
-        #await discordChannel.send("I'm online")
         await myDiscordClient.change_presence(status=discord.Status.online, activity=None)
 
-        def aprs_callback(packet):
-            packetQueue.sync_q.put(packet)
-            logging.info("put a packet on the queue, there are now "+str(packetQueue.sync_q.qsize()))
-            packetQueue.sync_q.join()
-        
-        #this doesn't block; OK to run synchronously
-        AIS.connect()
+        #start APRS
+        myAPRSClient.AIS.connect()
 
         #AIS.consumer() is a blocking synchronous function, so needs to be run in its own thread.
-        #Note: Ways to run sync functions from async functions:
-        #   - making a coroutine that calls AIS.consumer() and loop.create_task()'ing it
-        #   -  asyncio.run_in_executor()
-        #   -  asyncio.to_thread (requires python 3.9+).
-        #aprsConsumerTask = asyncio.create_task(asyncio.to_thread(AIS.consumer, aprs_callback, immortal=True, raw=True, blocking=True))
-        #await aprsConsumerTask
-        aprsFuture = loop.run_in_executor(None, functools.partial(AIS.consumer, aprs_callback, immortal=True, raw=True, blocking=True))
-        await aprs_worker(AIS, discordChannel, packetQueue.async_q,lastHeard,args)
-        await aprsFuture
-        packetQueue.close()
-        await packetQueue.wait_closed()
+        #(which is why we need janus, a thread-safe queue)
+        await bridge(myAPRSClient.AIS, discordChannel, packetQueue.async_q,lastHeard,args)
+        await myAPRSClient.aprsFuture()
+
+        #execution should never reach this point
+        raise asyncio.CancelledError
 
     except asyncio.CancelledError:
 
