@@ -1,8 +1,8 @@
 import os
+import sys
 import re
 import time
 from datetime import datetime
-import sys
 import argparse
 import traceback
 import logging
@@ -10,6 +10,8 @@ import aprslib
 import discord
 from discord.ext import commands
 import asyncio
+import janus
+import functools
 
 #notes on structure:
 #aprslib will callback aprs_callback() each time it receives a packet.
@@ -85,7 +87,58 @@ class TenRingDict(dict):
         for k, v in kwargs.items():
             self[k] = v
 
-async def main(loop):
+async def aprs_worker(AIS, discordChannel, queue: janus.AsyncQueue, lastHeard, args):
+    while True:
+        packet = await queue.get()
+        print("found a packet on the queue: "+str(packet))
+        try:
+            packet = aprslib.parse(packet) #this requires consumer(raw=True), but allows me to handle the error myself.
+
+            #warning: always check whether something is in the packet before trying to read it
+            #or else you'll get a dict KeyError
+            if 'format' in packet and packet['format'] == "message":
+                if 'response' in packet and packet['response'] == "ack":
+                    logging.info("Got an ACK for message "+packet['msgNo'])
+                elif 'message_text' in packet:
+                    logging.info("Got a message! Here it is: "+packet['from'] + ": " + packet['message_text']+"... msgno "+packet['msgNo'])
+                    if not packet['from'] in lastHeard:
+                        #this is a new client! add them to the tracker
+                        #use msgNo zero to initialize - aprs spec is always a positive number
+                        lastHeard.update({packet['from']:'0'})
+
+                    if int(packet['msgNo']) > int(lastHeard[packet['from']]):
+                        #note: this will run if it's a higher msgNo OR ...
+                        #if msgNo was set to zero by initialization
+
+                        #build a discord message.
+                        embed={
+                                    "title": packet['from']+": ",
+                                    "type": "rich",
+                                    "description": packet['message_text'],
+                                    "url": "https://aprs.fi/?c=raw&call="+packet['from'],
+                                    "timestamp": str(datetime.now()),
+                                    "footer": {
+                                        "text": "Licensed radio amateurs can post to this channel by sending APRS messages to callsign "+args.botCall+" with standard message format.",
+                                    },
+                                    "fields": [
+                                        {"name": "via", "value": packet['via'], "inline": True},
+                                        {"name": "msgNo", "value": packet['msgNo'], "inline": True},
+                                    ],
+                                }
+
+                        logging.info("This one's worth posting to Discord. Let's do it.")
+                        asyncio.create_task(send_aprs_ack(AIS,fromCall=args.botCall,toCall=packet['from'],msgNo=packet['msgNo']))
+                        asyncio.create_task(discordChannel.send(embed=discord.Embed.from_dict(embed)))
+                        lastHeard.update({packet['from']:packet['msgNo']})
+                    else:
+                        logging.info('Heard this one before - not posting, repeating ACK')
+                        asyncio.create_task(send_aprs_ack(AIS,fromCall=args.botCall,toCall=packet['from'],msgNo=packet['msgNo']))
+        except (aprslib.ParseError, aprslib.UnknownFormat) as exp:
+            logging.info("Parsing that packet failed - unknown format.")
+        queue.task_done()
+        print("now there are "+str(queue.qsize()))
+
+async def main():
     
     parser = argparse.ArgumentParser(description='Bridge between APRS and Discord.')
     parser.add_argument( '-log',
@@ -116,6 +169,11 @@ async def main(loop):
     #It's necessary because clients often don't receive their ACKs (such is radio)
     lastHeard = TenRingDict() 
 
+    #This queue is thread-safe.
+    #aprslib puts packets in queue from one thread
+    #discord gets those packets from the queue and processes them in another
+    packetQueue = janus.Queue()
+
     #configure Discord
     intents = discord.Intents.default()
     intents.message_content = True
@@ -139,54 +197,10 @@ async def main(loop):
         #await discordChannel.send("I'm online")
         await myDiscordClient.change_presence(status=discord.Status.online, activity=None)
 
-        #packet parsing logic
-        #This is going to call discordChannel.send() so I think it has to be declared 
-        #here, after discordChannel.
         def aprs_callback(packet):
-            try:
-                packet = aprslib.parse(packet) #this requires consumer(raw=True), but allows me to handle the error myself.
-
-                #warning: always check whether something is in the packet before trying to read it
-                #or else you'll get a dict KeyError
-                if 'format' in packet and packet['format'] == "message":
-                    if 'response' in packet and packet['response'] == "ack":
-                        logging.info("Got an ACK for message "+packet['msgNo'])
-                    elif 'message_text' in packet:
-                        logging.info("Got a message! Here it is: "+packet['from'] + ": " + packet['message_text']+"... msgno "+packet['msgNo'])
-                        if not packet['from'] in lastHeard:
-                            #this is a new client! add them to the tracker
-                            #use msgNo zero to initialize - aprs spec is always a positive number
-                            lastHeard.update({packet['from']:'0'})
-
-                        if int(packet['msgNo']) > int(lastHeard[packet['from']]):
-                            #note: this will run if it's a higher msgNo OR ...
-                            #if msgNo was set to zero by initialization
-
-                            #build a discord message.
-                            embed={
-                                        "title": packet['from']+": ",
-                                        "type": "rich",
-                                        "description": packet['message_text'],
-                                        "url": "https://aprs.fi/?c=raw&call="+packet['from'],
-                                        "timestamp": str(datetime.now()),
-                                        "footer": {
-                                            "text": "Licensed radio amateurs can post to this channel by sending APRS messages to callsign "+args.botCall+" with standard message format.",
-                                        },
-                                        "fields": [
-                                            {"name": "via", "value": packet['via'], "inline": True},
-                                            {"name": "msgNo", "value": packet['msgNo'], "inline": True},
-                                        ],
-                                    }
-
-                            logging.info("This one's worth posting to Discord. Let's do it.")
-                            loop.create_task(send_aprs_ack(AIS,fromCall=args.botCall,toCall=packet['from'],msgNo=packet['msgNo']))
-                            loop.create_task(discordChannel.send(embed=discord.Embed.from_dict(embed)))
-                            lastHeard.update({packet['from']:packet['msgNo']})
-                        else:
-                            logging.info('Heard this one before - not posting, repeating ACK')
-                            loop.create_task(send_aprs_ack(AIS,fromCall=args.botCall,toCall=packet['from'],msgNo=packet['msgNo']))
-            except (aprslib.ParseError, aprslib.UnknownFormat) as exp:
-                logging.info("Parsing that packet failed - unknown format.")
+            packetQueue.sync_q.put(packet)
+            logging.info("put a packet on the queue, there are now "+str(packetQueue.sync_q.qsize()))
+            packetQueue.sync_q.join()
         
         #this doesn't block; OK to run synchronously
         AIS.connect()
@@ -196,8 +210,13 @@ async def main(loop):
         #   - making a coroutine that calls AIS.consumer() and loop.create_task()'ing it
         #   -  asyncio.run_in_executor()
         #   -  asyncio.to_thread (requires python 3.9+).
-        aprsConsumerTask = asyncio.create_task(asyncio.to_thread(AIS.consumer, aprs_callback, raw=True, blocking=True))
-        await aprsConsumerTask
+        #aprsConsumerTask = asyncio.create_task(asyncio.to_thread(AIS.consumer, aprs_callback, immortal=True, raw=True, blocking=True))
+        #await aprsConsumerTask
+        aprsFuture = loop.run_in_executor(None, functools.partial(AIS.consumer, aprs_callback, immortal=True, raw=True, blocking=True))
+        await aprs_worker(AIS, discordChannel, packetQueue.async_q,lastHeard,args)
+        await aprsFuture
+        packetQueue.close()
+        await packetQueue.wait_closed()
 
     except asyncio.CancelledError:
 
@@ -213,10 +232,9 @@ async def main(loop):
         logging.info('closing aprs')
         AIS.close()
         logging.info('aprs is closed')
-        aprsConsumerTask.cancel()
-
-        #aprs offline notification
-        #aprsMsgNo = await send_aprs_msg(AIS,fromCall=args.botCall,toCall=args.adminCall+adminSSID,message="script offline",lineNo=aprsMsgNo)
+        
+        packetQueue.close()
+        await packetQueue.wait_closed()
 
         return str(aprsMsgNo)
 
@@ -226,7 +244,7 @@ if __name__ == "__main__":
     loop.set_debug(True)
     mainTask = None
     try:
-        mainTask = loop.create_task(main(loop))
+        mainTask = loop.create_task(main())
         result = loop.run_until_complete(mainTask)
         print('aprsMsgNo on exit: '+str(mainTask))
     except KeyboardInterrupt as e:

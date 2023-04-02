@@ -137,7 +137,7 @@ def main():
         discord.post(content="Bot online! Send an APRS message to "+args.botCall+" to have it posted here.",username=args.botName)
 
         # by default `raw` is False, then each line is ran through aprslib.parse()
-        AIS.consumer(aprs_handler, raw=True)
+        AIS.consumer(aprs_handler, immortal=True, raw=True)
 
         #we should never make it to here
         AIS.close()
