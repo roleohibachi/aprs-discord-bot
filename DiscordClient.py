@@ -1,14 +1,13 @@
 import discord
 import logging
 import asyncio
-import janus
+from RingDict import RingDict
 
 class DiscordClient(discord.Client):
     targetChannel : discord.channel = None
-    messageQueue = None
     botNick = None
     
-    lastHeard = janus.Queue()
+    lastHeard = RingDict(size=10)
     #    "AD8IS-10": {
     #        "thread":1234567890,   #the discord thread id used to converse with this client
     #        }

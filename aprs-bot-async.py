@@ -6,10 +6,10 @@ import logging
 import discord
 import asyncio
 import janus
-import APRSClient
 import aprslib
 
-import DiscordClient
+from APRSClient import APRSClient
+from DiscordClient import DiscordClient
 
 #notes on structure:
 #aprslib will callback aprs_callback() each time it receives a packet.
@@ -55,9 +55,9 @@ async def bridgeFromDiscordtoAPRS(DiscordClient, APRSClient):
         await message.add_reaction('\N{Warning Sign}')
 
 
-async def bridgeFromAPRStoDiscord(APRSClient, DiscordClient):
+async def bridgeFromAPRStoDiscord(APRSClient, DiscordClient, packetQueue: janus.AsyncQueue):
     while True:
-        packet = await APRSClient.packetQueue.get()
+        packet = await packetQueue.get()
         print("found a packet on the queue: "+str(packet))
         try:
             packet = aprslib.parse(packet) #this requires consumer(raw=True), but allows me to handle the error myself.
@@ -68,7 +68,7 @@ async def bridgeFromAPRStoDiscord(APRSClient, DiscordClient):
                 if 'response' in packet and packet['response'] == "ack":
                     logging.info("Got an ACK for message "+packet['msgNo'])
                     APRSClient.lastHeard[packet['from']]['acks'].add(int(packet['msgNo']))
-                    #todo post ACK to discord
+                    #todo post ACK to discord in thread
                 elif 'message_text' in packet:
                     
                     logging.info("Got a message! Here it is: "+packet['from'] + ": " + packet['message_text']+"... msgno "+packet['msgNo'])
@@ -113,8 +113,8 @@ async def bridgeFromAPRStoDiscord(APRSClient, DiscordClient):
                         asyncio.create_task(APRSClient.send_aprs_ack(toCall=packet['from'],msgNo=packet['msgNo']))
         except (aprslib.ParseError, aprslib.UnknownFormat) as exp:
             logging.info("Parsing that packet failed - unknown format.")
-        APRSClient.packetQueue.task_done()
-        print("now there are "+str(APRSClient.packetQueue.qsize()))
+        packetQueue.task_done()
+        print("now there are "+str(packetQueue.qsize()))
 
 async def main():
     
@@ -145,8 +145,8 @@ async def main():
         logging.warn("You should provide a passcode. I'm guessing it should be " + args.adminPass)
 
     #configure APRS
-    myAPRSClient = APRSClient(args.botCall, args.aprsMsgNo)
-    myAPRSClient.packetQueue = janus.Queue() #thread-safe queue for aprs packets received
+    myPacketQueue = janus.Queue() #thread-safe queue for aprs packets received
+    myAPRSClient = APRSClient(myPacketQueue.sync_q, args.botCall, args.aprsMsgNo)
     myAPRSClient.AIS = aprslib.IS(args.adminCall,args.adminPass,host=args.aprsHost,port=args.aprsPort)
     myAPRSClient.AIS.set_filter("g/"+args.botCall)
 
@@ -154,7 +154,6 @@ async def main():
     intents = discord.Intents.default()
     intents.message_content = True
     myDiscordClient = DiscordClient(args.botNick, intents=intents)
-    myDiscordClient.messageQueue = janus.Queue() #thread-safe queue for discord messages to send
 
     try:
 
@@ -169,8 +168,8 @@ async def main():
 
         #AIS.consumer() is a blocking synchronous function, so needs to be run in its own thread.
         #(which is why we need janus, a thread-safe queue)
-        await bridgeFromAPRStoDiscord(myAPRSClient, myDiscordClient)
-        await myAPRSClient.makeThreadedConsumer()
+        asyncio.create_task(bridgeFromAPRStoDiscord(myAPRSClient, myDiscordClient, myPacketQueue.async_q))
+        await myAPRSClient.makeThreadedConsumer(asyncio.get_event_loop())
 
         #execution should never reach this point
         raise asyncio.CancelledError
@@ -189,8 +188,8 @@ async def main():
         myAPRSClient.AIS.close()
         logging.info('aprs is closed')
         
-        APRSClient.packetQueue.close()
-        await APRSClient.packetQueue.wait_closed()
+        myPacketQueue.close()
+        await myPacketQueue.wait_closed()
 
         return str(myAPRSClient.aprsMsgNo)
 

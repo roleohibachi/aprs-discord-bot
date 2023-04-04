@@ -2,25 +2,22 @@ import functools
 import aprslib
 import asyncio
 import re 
-import logging 
-import janus
+import logging
+
+from RingDict import RingDict 
 
 class APRSClient:
-    packetQueue = None
-    AIS = aprslib.IS()
-    botCall = None
-    aprsMsgNo = 0
-
-    lastHeard = janus.Queue()
+    lastHeard = RingDict(size=10)
     #    "AD8IS-10": {
     #        "msgNo":10,            #the last msgNo received from this client (which we ACKed)
     #        "acks":{34,35,36}      #a set (no dupes) of acks received from this client (for messages we sent)
     #        }
     #    }
 
-    def __init__(self, botCall, initialMsgNo):
+    def __init__(self, packetQueue, botCall, initialMsgNo):
         self.aprsMsgNo = initialMsgNo
         self.botCall = botCall
+        self.packetQueue = packetQueue
 
     async def _checkRx(self, msgNo) -> bool:
         #await this with a timeout
@@ -33,8 +30,12 @@ class APRSClient:
     def sanitize_aprs_msg(message):
         return re.sub(r'[{:]','',message).encode('ascii','ignore')[:67] #sanitize
     
-    async def send_aprs_msg(self, toCall: str, message: str, fromCall: str = botCall, msgNo: int = aprsMsgNo): 
-        
+    async def send_aprs_msg(self, toCall: str, message: str, fromCall: str = None, msgNo: int = None): 
+        if not fromCall:
+            fromCall = self.botCall
+        if not msgNo:
+            msgNo = self.aprsMsgNo
+
         message=self.sanitize_aprs_msg(message)
 
         tries=3
@@ -59,7 +60,10 @@ class APRSClient:
         #(serialized msgNo's are kept since the protocol implements ACKs)
         return msgNo + 1 
     
-    async def send_aprs_ack(self, toCall: str, msgNo: int, fromCall: str = botCall):
+    async def send_aprs_ack(self, toCall: str, msgNo: int, fromCall: str = None):
+        if not fromCall:
+            fromCall = self.botCall
+
         #build ACK packet per APRS spec
         pkt=fromCall+">APP614"+",TCPIP*::"+toCall.ljust(9, " ")+":ack"+str(msgNo)
     
@@ -79,9 +83,8 @@ class APRSClient:
         return None #there's nothing to return for an ACK
 
     def aprs_callback(self, packet):
-        self.packetQueue.sync_q.put(packet)
-        logging.info("put a packet on the queue, there are now "+str(self.packetQueue.sync_q.qsize()))
-        self.packetQueue.sync_q.join()
+        self.packetQueue.put(packet)
+        logging.info("put a packet on the queue, there are now "+str(self.packetQueue.qsize()))
 
     def makeThreadedConsumer(self, loop):
         return loop.run_in_executor(None, functools.partial(self.AIS.consumer, self.aprs_callback, immortal=True, raw=True, blocking=True))
