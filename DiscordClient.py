@@ -18,14 +18,13 @@ class DiscordClient(discord.Client):
         self.botNick = botNick
 
     async def boot(self,botSecret):
-        logging.info("Discord logging in...")
+        logging.info("Discord logging in...", extra={'className': self.__class__.__name__})
         await self.login(token=botSecret)
-        logging.info("Discord logged in. Connecting...")
+        logging.info("Discord logged in. Connecting...", extra={'className': self.__class__.__name__})
         discord_task = asyncio.create_task(self.connect())
-        logging.info("Connection running in background. Waiting for ready.")
+        logging.info("Connection running in background. Waiting for ready.", extra={'className': self.__class__.__name__})
         await self.wait_until_ready()
-        await self.change_presence(status=discord.Status.online, activity=discord.Streaming(name="APRS to Discord", url="https://www.aprs-is.net/aprsisdata.aspx"))
 
     async def on_ready(self):
-        logging.info(f'Logged on as {self.user}!')
+        logging.info(f'Logged on as {self.user}!', extra={'className': self.__class__.__name__})
 

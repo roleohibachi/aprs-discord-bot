@@ -19,46 +19,54 @@ from DiscordClient import DiscordClient
 
 async def bridgeFromDiscordtoAPRS(DiscordClient, APRSClient):
     def check(message):
+
         #don't talk to yourself, silly bot
         if message.author == DiscordClient.user:
             return False
 
-        logging.info(f'Message from {message.author} aka {message.author.nick}: {message.content}')
+        logging.info(f'Message from {message.author.nick} in {str(message.channel)}: {message.content}')
 
         if message.reference:
             logging.info(f'(this is a reply to item '+str(message.reference))
             #not doing anything with replies for now
             return False
 
+        #todo handle people sending messages in old threads
+        #if message is in a thread, and the thread parent follows my naming convention:
+        #   add the thread to lastHeard
+
         if message.channel and any(callsign['thread']==message.channel.id for callsign in DiscordClient.lastHeard.values()): 
             #this must be an APRS client thread!
             for callsign in DiscordClient.lastHeard:
                 if DiscordClient.lastHeard[callsign]["thread"]==message.channel.id:
                     logging.info('(which I recognize as a reply to '+callsign)
-
+                    
                     #only allow club members to use this feature
                     #it is implied that club members are certified. todo verify?
                     memberRole = discord.utils.find(lambda r: r.name == "PPRAA Member", message.guild.roles) #todo make this generic
                     if memberRole in message.author.roles:
+                        logging.info('(sent by a club member who may use this service')
                         return True
+    while True:
+        message = await DiscordClient.wait_for('message', check=check)
 
-    message = await DiscordClient.wait_for('message', check=check)
-    fromCall=str(message.author.nick.split('|')[1].strip().upper().replace('Ø','0').encode('ascii', 'ignore'))
-    logging.info(f"(and since you're licensed, I'll forward via aprs, {fromCall}: {message.content}")
-    await message.add_reaction('\N{Clock Face One-Thirty}')
-    if (await APRSClient.send_aprs_msg(toCall = APRSClient.botCall, message = fromCall+":"+str(message.content))):
-        #todo make this an explicit reply, so users don't need training
-        await message.clear_reaction('\N{Clock Face One-Thirty}')
-        await message.add_reaction('\N{THUMBS UP SIGN}')
-    else:
-        await message.clear_reaction('\N{Clock Face One-Thirty}')
-        await message.add_reaction('\N{Warning Sign}')
+        fromCall: str = (message.author.nick.split('|')[1].strip().upper().replace('Ø','0').encode('ascii', 'ignore')).decode('ascii')
+        toCall: str = ([key for key, value in DiscordClient.lastHeard.items() if value['thread'] == message.channel.id][0])
+        logging.info(f"forwarding via aprs, {fromCall} -> {toCall}: {message.content}")
+
+        replyMessage = await message.reply("I will try to transmit this message 3 times over the next 90 seconds. If the recipient acknowledges, then you'll see a green check mark on your message. No check mark means no acknowledgement was received; however the message might still have been delivered.", delete_after=90) 
+        try:
+            await APRSClient.send_aprs_msg(toCall = toCall, message = fromCall+"-"+message.content)
+            await message.add_reaction('\N{white heavy check mark}')
+            await replyMessage.delete()
+        except asyncio.exceptions.TimeoutError:
+            await replyMessage.delete()
 
 
 async def bridgeFromAPRStoDiscord(APRSClient, DiscordClient, packetQueue: janus.AsyncQueue):
     while True:
         packet = await packetQueue.get()
-        print("found a packet on the queue: "+str(packet))
+        logging.info("found a packet on the queue: "+str(packet))
         try:
             packet = aprslib.parse(packet) #this requires consumer(raw=True), but allows me to handle the error myself.
 
@@ -68,7 +76,7 @@ async def bridgeFromAPRStoDiscord(APRSClient, DiscordClient, packetQueue: janus.
                 if 'response' in packet and packet['response'] == "ack":
                     logging.info("Got an ACK for message "+packet['msgNo'])
                     APRSClient.lastHeard[packet['from']]['acks'].add(int(packet['msgNo']))
-                    #todo post ACK to discord in thread
+                    #todo post receipt for ACK to discord in thread
                 elif 'message_text' in packet:
                     
                     logging.info("Got a message! Here it is: "+packet['from'] + ": " + packet['message_text']+"... msgno "+packet['msgNo'])
@@ -79,7 +87,8 @@ async def bridgeFromAPRStoDiscord(APRSClient, DiscordClient, packetQueue: janus.
                         APRSClient.lastHeard.update({
                             packet['from']:{
                                 "msgNo":0,
-                                "acks":{}
+                                "acks":set(),
+                                "nextMsgNo":1,
                                 }
                            })
 
@@ -95,9 +104,6 @@ async def bridgeFromAPRStoDiscord(APRSClient, DiscordClient, packetQueue: janus.
                                     "description": packet['message_text'],
                                     "url": "https://aprs.fi/?c=raw&call="+packet['from'],
                                     "timestamp": str(datetime.now()),
-                                    "footer": {
-                                        "text": "Licensed radio amateurs can post to this channel by sending APRS messages to callsign "+APRSClient.botCall+" with standard message format.",
-                                    },
                                     "fields": [
                                         {"name": "via", "value": packet['via'], "inline": True},
                                         {"name": "msgNo", "value": packet['msgNo'], "inline": True},
@@ -105,16 +111,33 @@ async def bridgeFromAPRStoDiscord(APRSClient, DiscordClient, packetQueue: janus.
                                 }
 
                         logging.info("This one's worth posting to Discord. Let's do it.")
+                        
+                        #todo myThread = await DiscordClient.targetChannel.create_thread(name=fromCall+" via APRS",message=None, type=discord.ChannelType.public_thread) #todo slowmode
+                        #if message.channel and any(callsign['thread']==message.channel.id for callsign in DiscordClient.lastHeard.values()): 
+                        if packet['from'] in DiscordClient.lastHeard:
+                            #use known thread
+                            targetThread = DiscordClient.targetChannel.get_thread(DiscordClient.lastHeard[packet['from']]["thread"])
+                        else:
+                            #if all else fails, create a new thread
+                            targetThread = await DiscordClient.targetChannel.create_thread(name=packet['from']+" via APRS",message=None, type=discord.ChannelType.public_thread) #todo slowmode
+                            DiscordClient.lastHeard.update({packet['from']:{"msgNo":packet['msgNo'],"thread":targetThread.id}})
+                            logging.info("created thread "+str(targetThread.id))
+                            await targetThread.send("Licensed radio amateurs can reply in this thread. If permitted, it will be retransmitted via APRS-IS in reply to "+packet['from'])
+                        
+                        #send message in thread
+                        asyncio.create_task(targetThread.send(embed=discord.Embed.from_dict(embed)))
+
+                        #acknowledge delivery via APRS
                         asyncio.create_task(APRSClient.send_aprs_ack(toCall=packet['from'],msgNo=packet['msgNo']))
-                        asyncio.create_task(DiscordClient.targetChannel.send(embed=discord.Embed.from_dict(embed)))
                         APRSClient.lastHeard[packet['from']].update({"msgNo":packet['msgNo']})
+
                     else:
                         logging.info('Heard this one before - not posting, repeating ACK')
                         asyncio.create_task(APRSClient.send_aprs_ack(toCall=packet['from'],msgNo=packet['msgNo']))
         except (aprslib.ParseError, aprslib.UnknownFormat) as exp:
             logging.info("Parsing that packet failed - unknown format.")
         packetQueue.task_done()
-        print("now there are "+str(packetQueue.qsize()))
+        logging.info("now there are "+str(packetQueue.qsize()))
 
 async def main():
     
@@ -137,7 +160,7 @@ async def main():
     args = parser.parse_args()
 
     #Use DEBUG to disable APRS transmissions. Use INFO to get lots of logging
-    logging.basicConfig( level=args.loglevel.upper() )
+    logging.basicConfig( level=args.loglevel.upper(), format='%(asctime)s: %(message)s' )
     #if logging.getLogger().isEnabledFor(logging.DEBUG): loop.set_debug(True)
 
     if not args.adminPass:
@@ -146,7 +169,7 @@ async def main():
 
     #configure APRS
     myPacketQueue = janus.Queue() #thread-safe queue for aprs packets received
-    myAPRSClient = APRSClient(myPacketQueue.sync_q, args.botCall, args.aprsMsgNo)
+    myAPRSClient = APRSClient(myPacketQueue.sync_q, str(args.botCall))
     myAPRSClient.AIS = aprslib.IS(args.adminCall,args.adminPass,host=args.aprsHost,port=args.aprsPort)
     myAPRSClient.AIS.set_filter("g/"+args.botCall)
 
@@ -159,9 +182,15 @@ async def main():
 
         #start discord
         await myDiscordClient.boot(args.botSecret)
+        await myDiscordClient.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.listening, name='APRS-IS for "'+args.botCall+'"'))
         logging.info("Discord ready.. fetching channel.")
         myDiscordClient.targetChannel = myDiscordClient.get_channel(int(args.botChannelID))
         logging.info("Discord will use channel "+str(myDiscordClient.targetChannel))
+
+        #populate lastHeard with existing threads
+        #TODO
+        for thread in myDiscordClient.targetChannel.threads:
+            print(thread)
 
         #start APRS
         myAPRSClient.AIS.connect()
@@ -169,6 +198,7 @@ async def main():
         #AIS.consumer() is a blocking synchronous function, so needs to be run in its own thread.
         #(which is why we need janus, a thread-safe queue)
         asyncio.create_task(bridgeFromAPRStoDiscord(myAPRSClient, myDiscordClient, myPacketQueue.async_q))
+        asyncio.create_task(bridgeFromDiscordtoAPRS(myDiscordClient,myAPRSClient))
         await myAPRSClient.makeThreadedConsumer(asyncio.get_event_loop())
 
         #execution should never reach this point
@@ -191,8 +221,6 @@ async def main():
         myPacketQueue.close()
         await myPacketQueue.wait_closed()
 
-        return str(myAPRSClient.aprsMsgNo)
-
 
 if __name__ == "__main__":
     loop = asyncio.get_event_loop()
@@ -201,12 +229,12 @@ if __name__ == "__main__":
     try:
         mainTask = loop.create_task(main())
         result = loop.run_until_complete(mainTask)
-        print('aprsMsgNo on exit: '+str(mainTask))
+        #this should never finish
+        raise KeyboardInterrupt
     except KeyboardInterrupt as e:
         logging.info("Shutting down gracefully")
         if mainTask:
             mainTask.cancel()
         mainTask = loop.run_until_complete(asyncio.wait_for(mainTask, timeout=5))
         logging.info('done cancelling')
-        print('aprsMsgNo on exit: '+str(mainTask))
         os._exit(0) #let OS kill remaining threads
