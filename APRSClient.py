@@ -24,7 +24,7 @@ class APRSClient:
         #it will poll on lastHeard to see if a client has ACKed a msgNo.
         while True:
             await asyncio.sleep(1)
-            if msgNo in self.lastHeard[toCall]["acks"]:
+            if toCall in self.lastHeard and "acks" in self.lastHeard[toCall] and msgNo in self.lastHeard[toCall]["acks"]:
                 return True
 
     def sanitize_aprs_msg(self, message) -> str:
@@ -40,7 +40,7 @@ class APRSClient:
         else:
             msgNo = 1
 
-        if not self.lastHeard[toCall]:
+        if not toCall in self.lastHeard:
             self.lastHeard.update({toCall:{"nextMsgNo":msgNo+1}})
         else:
             self.lastHeard[toCall].update({"nextMsgNo":msgNo+1})
